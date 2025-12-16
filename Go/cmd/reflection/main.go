@@ -1,10 +1,11 @@
-// Package main demonstrates Reflection pattern using Google ADK-Go
+// Package main demonstrates Reflection pattern using LoopAgent in Google ADK-Go
 //
-// Reflection cho phép agent tự đánh giá và cải thiện output qua nhiều vòng lặp.
-// Sử dụng mô hình Producer-Critic:
-// - Producer: Tạo code
-// - Critic: Review và đưa ra feedback
-// - Orchestrator: Điều phối vòng lặp cho đến khi đạt chất lượng
+// Reflection cho phep agent tu danh gia va cai thien output qua nhieu vong lap.
+// Su dung LoopAgent + functiontool de dieu khien vong lap:
+// - InitialProducer: Tao code ban dau
+// - Critic: Review va dua ra feedback hoac approve
+// - Refiner: Cai thien code hoac goi exitLoop neu approved
+// - LoopAgent: Lap cho den khi exitLoop() duoc goi hoac dat max iterations
 package main
 
 import (
@@ -15,233 +16,198 @@ import (
 
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
+	"google.golang.org/adk/agent/workflowagents/loopagent"
+	"google.golang.org/adk/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/cmd/launcher"
 	"google.golang.org/adk/cmd/launcher/full"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/model/gemini"
 	"google.golang.org/adk/tool"
-	"google.golang.org/adk/tool/agenttool"
+	"google.golang.org/adk/tool/functiontool"
 	"google.golang.org/genai"
 )
 
+// State keys
+const (
+	stateCode      = "current_code"
+	stateCritique  = "critique"
+	approvedPhrase = "CODE_APPROVED"
+)
+
 // ============================================================================
-// PRODUCER AGENT - Tạo code
+// EXIT LOOP TOOL
 // ============================================================================
 
-func createCodeProducer(ctx context.Context, m model.LLM) (agent.Agent, error) {
+// ExitLoopArgs dinh nghia arguments cho exitLoop tool (rong)
+type ExitLoopArgs struct{}
+
+// ExitLoopResults dinh nghia ket qua tra ve (rong)
+type ExitLoopResults struct{}
+
+// ExitLoop la function tool signal cho LoopAgent dung
+// Khi duoc goi, set ctx.Actions().Escalate = true
+func ExitLoop(ctx tool.Context, input ExitLoopArgs) (ExitLoopResults, error) {
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Printf("[exitLoop] Code da duoc phe duyet!\n")
+	fmt.Printf("[exitLoop] Triggered by agent: %s\n", ctx.AgentName())
+	fmt.Println("═══════════════════════════════════════════════════════")
+	ctx.Actions().Escalate = true
+	return ExitLoopResults{}, nil
+}
+
+// ============================================================================
+// INITIAL CODE PRODUCER
+// ============================================================================
+
+func createInitialProducer(m model.LLM) (agent.Agent, error) {
 	return llmagent.New(llmagent.Config{
-		Name:        "code_producer",
+		Name:        "InitialCodeProducer",
 		Model:       m,
-		Description: "Chuyên gia viết code. Tạo code ban đầu hoặc cải thiện code dựa trên feedback từ reviewer.",
-		Instruction: `Bạn là một Senior Software Engineer chuyên viết code Go.
+		Description: "Viet code ban dau dua tren yeu cau cua user.",
+		Instruction: `Ban la mot Senior Software Engineer chuyen viet code Go.
 
-NHIỆM VỤ:
-Khi nhận yêu cầu viết code hoặc feedback để cải thiện:
+NHIEM VU:
+Viet code theo yeu cau cua nguoi dung.
 
-1. NẾU LÀ YÊU CẦU MỚI:
-   - Phân tích yêu cầu kỹ lưỡng
-   - Viết code sạch, có comment giải thích
-   - Xử lý tất cả edge cases
-   - Tuân thủ Go best practices và idioms
-   - Thêm error handling đầy đủ
+YEU CAU:
+- Viet code sach, co comment giai thich
+- Xu ly cac edge cases co ban
+- Tuan thu Go best practices
+- Them error handling
 
-2. NẾU CÓ FEEDBACK TỪ REVIEWER:
-   - Đọc kỹ TỪNG điểm feedback
-   - Sửa TẤT CẢ các vấn đề được chỉ ra
-   - Không bỏ sót bất kỳ feedback nào
-   - Giải thích những thay đổi đã làm
-
-ĐỊNH DẠNG TRẢ VỀ:
-
-📝 CODE:
-` + "```go" + `
-// Code của bạn ở đây
-// Phải có comment giải thích logic phức tạp
-` + "```" + `
-
-📌 GIẢI THÍCH:
-[Giải thích ngắn gọn về code hoặc các thay đổi đã thực hiện]
-
-⚠️ LƯU Ý:
-[Các điểm cần lưu ý khi sử dụng code này]`,
+DINH DANG:
+Output CHI code Go trong block, khong giai thich them.`,
+		OutputKey: stateCode,
 	})
 }
 
 // ============================================================================
-// CRITIC AGENT - Review code
+// CODE CRITIC
 // ============================================================================
 
-func createCodeCritic(ctx context.Context, m model.LLM) (agent.Agent, error) {
+func createCodeCritic(m model.LLM) (agent.Agent, error) {
 	return llmagent.New(llmagent.Config{
-		Name:        "code_critic",
+		Name:        "CodeCritic",
 		Model:       m,
-		Description: "Senior Code Reviewer. Đánh giá chất lượng code và đưa ra feedback chi tiết, có thể hành động được.",
-		Instruction: `Bạn là một Principal Engineer với 20 năm kinh nghiệm.
-Vai trò của bạn là thực hiện code review tỉ mỉ và KHÁCH QUAN.
+		Description: "Review code va dua ra feedback hoac approve.",
+		Instruction: fmt.Sprintf(`Ban la mot Principal Engineer voi 20 nam kinh nghiem.
+Vai tro cua ban la review code mot cach ti mi va KHACH QUAN.
 
-TIÊU CHÍ ĐÁNH GIÁ (theo thứ tự ưu tiên):
+**CODE CAN REVIEW:**
+"""
+{%s}
+"""
 
-1. 🔴 CORRECTNESS (Tính đúng đắn) - QUAN TRỌNG NHẤT
-   - Code có hoạt động đúng với mọi input không?
-   - Logic có chính xác không?
-   - Có bug tiềm ẩn không?
+**TIEU CHI DANH GIA:**
+1. Tinh dung dan - Code co hoat dong dung khong?
+2. Error handling - Co xu ly loi day du khong?
+3. Edge cases - Co xu ly cac truong hop dac biet khong?
+4. Code quality - Code co sach, de doc khong?
 
-2. 🟠 ERROR HANDLING (Xử lý lỗi)
-   - Có xử lý tất cả các lỗi có thể xảy ra không?
-   - Error messages có rõ ràng không?
-   - Có return error thay vì panic không?
+**HANH DONG:**
 
-3. 🟡 EDGE CASES (Trường hợp đặc biệt)
-   - Empty input, nil values
-   - Boundary conditions (0, negative, max values)
-   - Concurrent access (nếu applicable)
+NEU code co 1-2 diem can cai thien:
+-> Liet ke cu the cac diem can sua.
+-> Output CHI feedback text.
 
-4. 🟢 CODE QUALITY (Chất lượng code)
-   - Naming conventions (Go idioms)
-   - Code organization
-   - Comments và documentation
-   - DRY principle
-
-5. 🔵 PERFORMANCE (Hiệu suất)
-   - Time complexity
-   - Space complexity
-   - Unnecessary allocations
-
-QUY TRÌNH ĐÁNH GIÁ:
-1. Đọc và hiểu TOÀN BỘ code
-2. Kiểm tra TỪNG tiêu chí ở trên
-3. Liệt kê CỤ THỂ các vấn đề
-4. Đưa ra cách sửa CHI TIẾT
-
-QUAN TRỌNG:
-- Nếu code ĐÃ ĐẠT TẤT CẢ tiêu chí: Trả lời CHÍNH XÁC "✅ CODE_APPROVED"
-- Nếu CÒN vấn đề: Liệt kê CHI TIẾT để developer sửa được
-
-ĐỊNH DẠNG PHẢN HỒI:
-
-═══════════════════════════════════════════════════════
-📋 CODE REVIEW REPORT
-═══════════════════════════════════════════════════════
-
-🔴 VẤN ĐỀ NGHIÊM TRỌNG (phải sửa):
-1. [Vấn đề]: [Mô tả]
-   → Cách sửa: [Hướng dẫn cụ thể]
-
-🟡 CẦN CẢI THIỆN (nên sửa):
-1. [Điểm cải thiện]: [Mô tả]
-   → Gợi ý: [Hướng dẫn]
-
-🟢 ĐIỂM TỐT:
-• [Những gì code đã làm tốt]
-
-📊 ĐIỂM ĐÁNH GIÁ: [X]/10
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-HOẶC NẾU CODE HOÀN HẢO:
-
-═══════════════════════════════════════════════════════
-✅ CODE_APPROVED
-
-Lý do phê duyệt:
-• [Điểm tốt 1]
-• [Điểm tốt 2]
-• [Điểm tốt 3]
-
-📊 ĐIỂM ĐÁNH GIÁ: 10/10
-═══════════════════════════════════════════════════════`,
+NEU code da hoan hao, dat TAT CA tieu chi:
+-> Tra loi CHINH XAC: %s
+-> KHONG them bat ky text nao khac.`, stateCode, approvedPhrase),
+		OutputKey: stateCritique,
 	})
 }
 
 // ============================================================================
-// REFLECTION ORCHESTRATOR - Điều phối vòng lặp
+// CODE REFINER (voi exitLoop tool)
 // ============================================================================
 
-func createReflectionOrchestrator(ctx context.Context, m model.LLM, producer, critic agent.Agent) (agent.Agent, error) {
-	// Wrap Producer và Critic thành tools
-	producerTool := agenttool.New(producer, nil)
-	criticTool := agenttool.New(critic, nil)
-
+func createCodeRefiner(m model.LLM, exitLoopTool tool.Tool) (agent.Agent, error) {
 	return llmagent.New(llmagent.Config{
-		Name:        "reflection_orchestrator",
+		Name:        "CodeRefiner",
 		Model:       m,
-		Description: "Điều phối viên Code Review System - Thực hiện Reflection Loop để cải thiện code",
-		Instruction: `Bạn là điều phối viên hệ thống Code Review tự động với khả năng REFLECTION.
+		Description: "Cai thien code hoac goi exitLoop neu code duoc approve.",
+		Instruction: fmt.Sprintf(`Ban la mot Software Engineer cai thien code dua tren feedback.
 
-**QUY TRÌNH REFLECTION (TUÂN THỦ NGHIÊM NGẶT):**
+**CODE HIEN TAI:**
+"""
+{%s}
+"""
 
-Khi người dùng yêu cầu viết code, thực hiện VÒNG LẶP sau:
+**FEEDBACK TU REVIEWER:**
+{%s}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VÒNG LẶP 1:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BƯỚC 1.1: Gọi code_producer với yêu cầu của người dùng
-BƯỚC 1.2: Gọi code_critic để review code vừa tạo
-BƯỚC 1.3: Kiểm tra kết quả:
-          - Nếu critic trả về "CODE_APPROVED" → Kết thúc
-          - Nếu có feedback → Tiếp tục VÒNG LẶP 2
+**HANH DONG:**
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VÒNG LẶP 2 (nếu cần):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BƯỚC 2.1: Gọi code_producer với feedback từ vòng 1
-BƯỚC 2.2: Gọi code_critic để review code cải tiến
-BƯỚC 2.3: Kiểm tra kết quả:
-          - Nếu critic trả về "CODE_APPROVED" → Kết thúc
-          - Nếu có feedback → Tiếp tục VÒNG LẶP 3
+1. Doc ky feedback tu reviewer.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VÒNG LẶP 3 (cuối cùng):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BƯỚC 3.1: Gọi code_producer với feedback từ vòng 2
-BƯỚC 3.2: Gọi code_critic lần cuối
-BƯỚC 3.3: Dừng lại dù kết quả thế nào
+2. NEU feedback CHINH XAC la "%s":
+   -> Goi function 'exitLoop' NGAY LAP TUC.
+   -> KHONG output bat ky text nao.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-KẾT THÚC - TRÌNH BÀY KẾT QUẢ:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. NEU feedback chua goi y cai thien:
+   -> Ap dung TAT CA cac goi y.
+   -> Output CHI code da cai thien.
+   -> KHONG giai thich, KHONG goi exitLoop.`, stateCode, stateCritique, approvedPhrase),
+		Tools:     []tool.Tool{exitLoopTool},
+		OutputKey: stateCode,
+	})
+}
 
-╔═══════════════════════════════════════════════════════════════╗
-║           🔄 REFLECTION PROCESS COMPLETED                     ║
-╠═══════════════════════════════════════════════════════════════╣
-║                                                               ║
-║ 📊 THỐNG KÊ:                                                  ║
-║ • Số vòng lặp: [X]                                           ║
-║ • Trạng thái: [✅ Approved / ⚠️ Best effort sau 3 vòng]      ║
-║                                                               ║
-║ 📝 CODE CUỐI CÙNG:                                           ║
-║ [Code đã được approve hoặc version tốt nhất]                  ║
-║                                                               ║
-║ 📋 LỊCH SỬ CẢI TIẾN:                                         ║
-║ • Vòng 1: [Tóm tắt feedback và thay đổi]                     ║
-║ • Vòng 2: [Tóm tắt feedback và thay đổi]                     ║
-║ • Vòng 3: [Kết quả cuối]                                     ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
+// ============================================================================
+// REFLECTION PIPELINE
+// ============================================================================
 
-**KHI NGƯỜI DÙNG CHÀO HỎI HOẶC HỎI THÔNG TIN:**
-Giới thiệu hệ thống:
+func createReflectionPipeline(m model.LLM) (agent.Agent, error) {
+	// 1. Tao Initial Producer (chay 1 lan dau)
+	initialProducer, err := createInitialProducer(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create initial producer: %w", err)
+	}
 
-"Xin chào! 👋 Tôi là Code Review System với khả năng Reflection.
+	// 2. Tao exitLoop tool
+	exitLoopTool, err := functiontool.New(
+		functiontool.Config{
+			Name:        "exitLoop",
+			Description: "Goi function nay KHI VA CHI KHI critique CHINH XAC la CODE_APPROVED. Khi goi, KHONG output text.",
+		},
+		ExitLoop,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exitLoop tool: %w", err)
+	}
 
-🔄 Cách hoạt động:
-1. Bạn yêu cầu → Tôi viết code
-2. Code được tự động review
-3. Nếu có vấn đề → Tự động sửa và review lại
-4. Lặp lại đến khi code hoàn hảo (tối đa 3 vòng)
+	// 3. Tao Critic Agent (trong loop)
+	critic, err := createCodeCritic(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create critic: %w", err)
+	}
 
-📝 Ví dụ yêu cầu:
-• 'Viết hàm tính fibonacci trong Go'
-• 'Tạo function validate email'
-• 'Implement stack data structure'
-• 'Viết HTTP handler cho user registration'
+	// 4. Tao Refiner Agent voi exitLoop tool (trong loop)
+	refiner, err := createCodeRefiner(m, exitLoopTool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create refiner: %w", err)
+	}
 
-Bạn muốn tôi viết code gì?"
+	// 5. Tao Refinement Loop
+	refinementLoop, err := loopagent.New(loopagent.Config{
+		MaxIterations: 3,
+		AgentConfig: agent.Config{
+			Name:        "RefinementLoop",
+			Description: "Vong lap: Critic review -> Refiner cai thien hoac exit",
+			SubAgents:   []agent.Agent{critic, refiner},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create loop agent: %w", err)
+	}
 
-**LƯU Ý QUAN TRỌNG:**
-- Mỗi vòng phải gọi CẢ producer VÀ critic
-- Không bỏ qua bất kỳ vòng nào khi còn feedback
-- Tối đa 3 vòng - sau đó trả về kết quả tốt nhất`,
-		Tools: []tool.Tool{producerTool, criticTool},
+	// 6. Tao Pipeline tong the
+	return sequentialagent.New(sequentialagent.Config{
+		AgentConfig: agent.Config{
+			Name:        "CodeReviewPipeline",
+			Description: "Pipeline: InitialProducer -> RefinementLoop",
+			SubAgents:   []agent.Agent{initialProducer, refinementLoop},
+		},
 	})
 }
 
@@ -249,48 +215,54 @@ Bạn muốn tôi viết code gì?"
 // MAIN
 // ============================================================================
 
+func printBanner() {
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Println("  Code Review System - Reflection Pattern with LoopAgent")
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Println("")
+	fmt.Println("  Pipeline:")
+	fmt.Println("  ┌─────────────────────────────────────────────────┐")
+	fmt.Println("  │  1. InitialProducer → {current_code}            │")
+	fmt.Println("  │                 ↓                               │")
+	fmt.Println("  │  2. LoopAgent (max=3)                           │")
+	fmt.Println("  │     ┌─────────────────────────────────────┐     │")
+	fmt.Println("  │     │ Critic → {critique}                 │     │")
+	fmt.Println("  │     │            ↓                        │     │")
+	fmt.Println("  │     │ Refiner → exitLoop() or refine      │     │")
+	fmt.Println("  │     └─────────────────────────────────────┘     │")
+	fmt.Println("  └─────────────────────────────────────────────────┘")
+	fmt.Println("")
+	fmt.Println("Khoi dong server...")
+	fmt.Println("Vi du: 'Viet ham tinh fibonacci trong Go'")
+}
+
 func main() {
 	ctx := context.Background()
 
 	apiKey := os.Getenv("GOOGLE_API_KEY")
 	if apiKey == "" {
-		log.Fatal("Vui lòng set GOOGLE_API_KEY environment variable")
+		log.Fatal("Vui long set GOOGLE_API_KEY environment variable")
 	}
 
 	geminiModel, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
 		APIKey: apiKey,
 	})
 	if err != nil {
-		log.Fatalf("Không thể tạo model: %v", err)
+		log.Fatalf("Khong the tao model: %v", err)
 	}
 
-	// Tạo Producer Agent
-	producer, err := createCodeProducer(ctx, geminiModel)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Tạo Critic Agent
-	critic, err := createCodeCritic(ctx, geminiModel)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Tạo Reflection Orchestrator
-	orchestrator, err := createReflectionOrchestrator(ctx, geminiModel, producer, critic)
+	// Tao Pipeline
+	pipeline, err := createReflectionPipeline(geminiModel)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	config := &launcher.Config{
-		AgentLoader: agent.NewSingleLoader(orchestrator),
+		AgentLoader: agent.NewSingleLoader(pipeline),
 	}
 
 	lch := full.NewLauncher()
-	fmt.Println("=== Code Review System - Reflection Pattern Demo ===")
-	fmt.Println("Code sẽ được tự động review và cải thiện qua nhiều vòng lặp")
-	fmt.Println("Producer → Code → Critic → Feedback → Producer → ...")
-	fmt.Println("Khởi động server...")
+	printBanner()
 
 	err = lch.Execute(ctx, config, os.Args[1:])
 	if err != nil {
