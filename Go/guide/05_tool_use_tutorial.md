@@ -1332,4 +1332,4 @@ User: 100 độ F là bao nhiêu độ C?
 
 1. [ADK-Go Tools Documentation](https://google.github.io/adk-docs/tools/)
 2. [OpenAI Function Calling](https://platform.openai.com/docs/guides/function-calling)
-3. [Chapter 5: Tool Use - Agentic Design Patterns](../doc_vi/05_Chapter_5_Tool_Use.md)
+3. [Chapter 5: Tool Use - Agentic Design Patterns](../../doc_vi/05_Chapter_5_Tool_Use.md)

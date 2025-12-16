@@ -921,4 +921,4 @@ Expected:
 
 1. [ADK-Go Multi-Agent Documentation](https://google.github.io/adk-docs/agents/multi-agents/)
 2. [Training Language Models to Self-Correct via Reinforcement Learning](https://arxiv.org/abs/2409.12917)
-3. [Chapter 4: Reflection - Agentic Design Patterns](../doc_vi/04_Chapter_4_Reflection.md)
+3. [Chapter 4: Reflection - Agentic Design Patterns](../../doc_vi/04_Chapter_4_Reflection.md)
